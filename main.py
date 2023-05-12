@@ -19,6 +19,8 @@ import random
 import torch.backends.cudnn as cudnn
 import numpy as np
 from sklearn.metrics import confusion_matrix
+import pandas as pd
+import torchmetrics
 
 from torchvision.models import swin_v2_s
 from torchvision.models import Swin_V2_S_Weights
@@ -146,11 +148,13 @@ def get_args_parser(add_help=True):
 
 
 
-def train_one_epoch(net, criterion, optimizer, data_loader, device, epoch):
+def train_one_epoch(net, criterion, optimizer, data_loader, device, epoch, num_classes):
     print('\n[ Train epoch: %d ]' % epoch)
     net.train()
+    acc_metric = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
+    f1_metric = torchmetrics.F1Score(task="multiclass", num_classes=num_classes, average='weighted')
+    
     train_loss = 0
-    correct = 0
     total = 0
 
 
@@ -164,36 +168,50 @@ def train_one_epoch(net, criterion, optimizer, data_loader, device, epoch):
 
         optimizer.step()
         train_loss += loss.item()
-        _, predicted = outputs.max(1)
-
+        
+        
+        
         total += targets.size(0)
-        current_correct = predicted.eq(targets).sum().item()
-        correct += current_correct
+        
+        preds = outputs.cpu()
+        target = targets.cpu()
+        
+        acc = acc_metric(preds, target)
+        f1 = f1_metric(preds, target)
 
     # train_acc.append(correct / total)
+    acc = acc_metric.compute()
+    f1 = f1_metric.compute()
 
-    print('\nTotal average train accuarcy:', correct / total)
-    print('Total average train loss:', train_loss / total)
+    print(f'Epoch {epoch:<4} ,train_Loss = {train_loss / total :<10}, train_acc = {acc:<10}, train_f1 = {f1:<10}')
+    
+    acc_metric.reset()
+    f1_metric.reset()
 
 
-def evaluate(net, criterion,  valid_loader, device, epoch, args):
+def evaluate(net, criterion,  valid_loader, device, epoch, args, num_classes):
     print('\n[ Test epoch: %d ]' % epoch)
     net.eval()
-    loss = 0
-    correct = 0
+    valid_loss = 0
     total = 0
-    y_pred = []
-    y_true = []
+    acc_metric = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
+    f1_metric = torchmetrics.F1Score(task="multiclass", num_classes=num_classes, average='weighted')
+    confmat = torchmetrics.ConfusionMatrix(task="multiclass", num_classes=num_classes)
     with torch.inference_mode():
         for batch_idx, (inputs, targets) in enumerate(valid_loader):
             inputs, targets = inputs.to(device), targets.to(device)
             total += targets.size(0)
 
             outputs = net(inputs)
-            loss += criterion(outputs, targets).item()
-
-            _, predicted = outputs.max(1)
-            correct += predicted.eq(targets).sum().item()
+            
+            valid_loss += criterion(outputs, targets).item()
+            
+            preds = outputs.cpu()
+            target = targets.cpu()
+            
+            acc = acc_metric(preds, target)
+            f1 = f1_metric(preds, target)
+            c_matrix = confmat(preds, target)
             
             if args.confusion_matrix:
             
@@ -203,8 +221,13 @@ def evaluate(net, criterion,  valid_loader, device, epoch, args):
                 labels = targets.data.cpu().numpy()
                 y_true.extend(labels) # Save Truth
 
-        print('\nTotal average test accuracy:', correct / total)
-        print('Total average test loss:', loss / total)
+            acc = acc_metric.compute()
+            f1 = f1_metric.compute()    
+        print(f'Epoch {epoch:<4} ,valid_Loss = {valid_loss / total :<10}, valid_acc = {acc:<10}, valid_f1 = {f1:<10}')
+            
+        acc_metric.reset()
+        f1_metric.reset()
+        confmat.reset()
         
         if args.confusion_matrix:
             cf_matrix = confusion_matrix(y_true, y_pred)
@@ -215,7 +238,7 @@ def evaluate(net, criterion,  valid_loader, device, epoch, args):
 
 
 
-    return correct / total
+    return f1
 
 
 def load_data(traindir, valdir, args):
@@ -417,12 +440,12 @@ def main(args):
     max_eval_acc = 0
     max_matrix = []
     for epoch in range(args.start_epoch, args.epochs):
-        train_one_epoch(model, criterion, optimizer, data_loader, device, epoch)
+        train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, num_classes = num_classes)
         lr_scheduler.step()
         if args.confusion_matrix:
-            eval_acc, c_matrix = evaluate(model, criterion, data_loader_test, epoch=epoch, device=device, args=args)
+            eval_acc, c_matrix = evaluate(model, criterion, data_loader_test, epoch=epoch, device=device, args=args, num_classes = num_classes)
         else:
-            eval_acc = evaluate(model, criterion, data_loader_test, epoch=epoch, device=device, args=args)
+            eval_acc = evaluate(model, criterion, data_loader_test, epoch=epoch, device=device, args=args, num_classes = num_classes)
         
 
         if max_eval_acc < eval_acc:
@@ -472,25 +495,36 @@ def main(args):
         
         test_transform = transforms.Compose([
             transforms.ToTensor(), #이미지 데이터를 tensor 데이터 포멧으로 바꾸어줍니다.
-            transforms.Resize([300,300]), #이미지의 크기가 다를 수 있으니 크기를 통일해 줍니다.
-            #transforms.Normalize(mean=(0.139, 0, 0), std=(0.073, 1, 1)) #픽셀 단위 데이터를 정규화 시켜줍니다.
+            transforms.Resize([280,280]), #이미지의 크기가 다를 수 있으니 크기를 통일해 줍니다.
+            transforms.Normalize(mean=(0.139, 0, 0), std=(0.073, 1, 1)) #픽셀 단위 데이터를 정규화 시켜줍니다.
         ])
         test_data = Testset(test_list, test_transform)
         test_loader = DataLoader(test_data, batch_size=args.batch_size)
         
+        model.load_state_dict(torch.load(os.path.join(args.output_dir, str(args.data_path).split('/')[-1]+'_'+args.model+"_best.pth")))
+        
         model.eval()
         test_idx = []
+        test_prob = []
+        pd_dict = {}
         for x in test_loader:
             x = x.to(device)
             outputs = model(x)
-            predicted = outputs.argmax(1)
-            predicted = predicted.detach().cpu().numpy().tolist()
-            test_idx.extend(predicted)
+            prob = nn.functional.softmax(outputs, dim=1)
+            top_p, top_class = prob.topk(1, dim = 1)
+            top_class = top_class.detach().cpu().numpy().tolist()
+            prob = prob.detach().cpu().numpy().tolist()
+            test_idx.extend(top_class)
+            test_prob.extend(prob)
             
-        print(test_idx)
-        with open('./train_log/' + str(args.data_path).split('/')[-1] +'_'+args.model+".txt", 'a') as f:
-            f.write(str(test_list)+'\n')
-            f.write(str(test_idx))
+        test_list = list(map(lambda x: x.split('/')[-1], test_list))
+        pd_dict['test_list'] = test_list
+        pd_dict['test_idx'] = test_idx
+        pd_dict['test_prob'] = test_prob
+        
+        test_df = pd.DataFrame(pd_dict)
+        print('./train_log/' + str(args.data_path).split('/')[-1] +'_'+args.model+".csv")
+        test_df.to_csv('./train_log/' + str(args.data_path).split('/')[-1] +'_'+args.model+".csv")
             
     
     

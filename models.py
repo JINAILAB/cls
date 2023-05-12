@@ -19,7 +19,7 @@ class EModel(nn.Module):
         self.FC = nn.Linear(1000, classes)
 
     def forward(self, x):
-        x = self.LN(x)
+        #x = self.LN(x)
         x = self.pretrained(x)
         x = self.FC(x)
         return x
